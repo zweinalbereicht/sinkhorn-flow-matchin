@@ -35,13 +35,18 @@ class SinkhornModel():
         self.covs = torch.zeros(len(self.weights),2,2)
         assert self.weights.shape[0] == self.means.shape[0] == self.covs.shape[0]
 
-        bin_centers = (self.bins[1:] - self.bin_[:-1]) / 2
+        bin_centers = (self.bins[1:] + self.bins[:-1]) / 2
         for i,b1 in enumerate(bin_centers):
             for j,b2 in enumerate(bin_centers):
                 self.weights[i + nb_bins * j] = self.push_forward[i,j]
                 self.means[i + nb_bins * j] = torch.tensor([b1,b2])
-                self.covs[i + nb_bins * j] = torch.eye(2) * self.bin_size ** 2 # arbitrary choice here and hardcoded for dimension 1 -> 1
+                self.covs[i + nb_bins * j] = torch.eye(2) * self.bin_size ** 2 / 2 # arbitrary choice here and hardcoded for dimension 1 -> 1
 
+        # watch out for empty weights which can arise
+        mask = torch.clone(self.weights)>0
+        self.weights = self.weights[mask]
+        self.means = self.means[mask]
+        self.covs = self.covs[mask]
 
         component_distributions = D.Independent(D.MultivariateNormal(self.means,
                                                                      self.covs), 0)
