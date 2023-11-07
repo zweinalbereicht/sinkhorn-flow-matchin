@@ -35,8 +35,9 @@ class SinkhornModel():
         self.covs = torch.zeros(len(self.weights),2,2)
         assert self.weights.shape[0] == self.means.shape[0] == self.covs.shape[0]
 
-        for i,b1 in enumerate(self.bins[1:]):
-            for j,b2 in enumerate(self.bins[1:]):
+        bin_centers = (self.bins[1:] - self.bin_[:-1]) / 2
+        for i,b1 in enumerate(bin_centers):
+            for j,b2 in enumerate(bin_centers):
                 self.weights[i + nb_bins * j] = self.push_forward[i,j]
                 self.means[i + nb_bins * j] = torch.tensor([b1,b2])
                 self.covs[i + nb_bins * j] = torch.eye(2) * self.bin_size ** 2 # arbitrary choice here and hardcoded for dimension 1 -> 1

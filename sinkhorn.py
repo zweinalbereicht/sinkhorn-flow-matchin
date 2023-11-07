@@ -61,10 +61,11 @@ class Data():
 
 
 class Sinkhorn():
-    def __init__(self, device=torch.device("cpu"), train=True, source="samples",init_samples=torch.randn(1000), target_samples=torch.randn(1000)):
+    def __init__(self, device=torch.device("cpu"), train=True, source="samples",init_samples=torch.randn(1000), target_samples=torch.randn(1000), epsilon=1):
         self.device = device
         self.data = Data(self.device,data_source=source,init_samples=init_samples, target_samples=target_samples)
         xs = np.array(self.data.bins[:-1])
+        self.epsilon = epsilon
         self.push_forward = None
         if (train):
             self._train()
@@ -112,25 +113,40 @@ class Sinkhorn():
 
         return torch.diag(up.squeeze(1)) @ K @ torch.diag(vp.squeeze(1)) +  ( delta_a @ delta_b.T ) / torch.norm(delta_a,1)
 
-    def _train(self,eps=1,n_iter=1000):
+    def _train(self,eps=None,n_iter=1000):
         """Trains self.push_forward map based on sinkhorn algorithm
         """
         xs = torch.tensor(self.data.bins[:-1], device=self.device).unsqueeze(1) # arbitrary bin crop but okay
         ys = xs.clone()
+        if eps is None:
+            eps = self.epsilon
         self.push_forward = self.sinkhorn(xs,
                                           ys,
                                           self.data.current_dist.unsqueeze(1),
                                           self.data.target_dist.unsqueeze(1),
-                                          n_iter=n_iter,
-                                          eps=eps)
+                                          eps=eps,
+                                          n_iter=n_iter)
 
-        # print(torch.sum(self.push_forward, dim=1))
-        # print(self.data.current_dist)
         assert(torch.allclose(torch.sum(self.push_forward, dim=1),
                               self.data.current_dist)) # checks if we have have the marginals right
 
         assert(torch.allclose(torch.sum(self.push_forward, dim=0),
                               self.data.target_dist))
+
+    # compute the squared wasertein cost associated to the computed coupling
+    def get_squared_wassertein_distance(self):
+        xs = torch.tensor((self.data.bins[:-1]+self.data.bins[1:])/2, device=self.device).unsqueeze(1)
+        ys = xs.clone()
+        c_x_y = ( xs - ys.t() ) ** 2
+        return torch.sum(c_x_y * self.push_forward) # element wise multiplication
+
+    # compute the regurlarized squared wasertein cost associated to the computed coupling
+    # L(P) = sum cij * pij - epsilon * sum pij (log(pij)-1)
+    # problem here because we have null entries.
+    def get_regularized_wassertein_distance(self):
+        sq_wassertein = self.get_squared_wassertein_distance()
+        entropy = torch.sum(self.push_forward * (torch.log(self.push_forward) - 1))
+        return sq_wassertein + self.epsilon * entropy
 
     def get_q(self, t_frac):
         """Gets the intermediate probability distribution at t_frac along transport
