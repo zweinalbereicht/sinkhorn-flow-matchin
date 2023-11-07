@@ -8,13 +8,15 @@ torch.set_printoptions(sci_mode=False)
 class Data():
     def __init__(self, device=torch.device("cpu"),data_source="filename",init_samples=torch.randn(1000), target_samples=torch.randn(1000)):
         self.device = device
-        self.bins = np.arange(-10, 10, 1, dtype=np.float32) # hardcoding the bins might be an issue actually
+        self.bins = np.arange(-10, 10, 0.5, dtype=np.float32) # hardcoding the bins might be an issue actually
+        self.bin_size = torch.diff(torch.tensor(self.bins))[0]
         self.init_samples = init_samples
         self.target_samples = target_samples
         if data_source == "filename":
             self.target_dist, self.current_dist = self._init_data()
         else :
-            self.target_dist, self.current_dist = self._init_data_from_samples(self.target_samples,self.init_samples)
+            self.bins, self.target_dist, self.current_dist = self._init_data_from_samples(self.init_samples,self.target_samples)
+            self.bin_size = torch.diff(torch.tensor(self.bins))[0]
 
     def _init_data(self, filename = "./data/high_temp_clusters_shape.npy"):
         """Initializes target_dist and current_dist
@@ -42,40 +44,47 @@ class Data():
             target_dist: A tensor of shape (num_bins_init, 1) representing the target distribution
             init_samples: A tensor of shape (num_bins_final, 1) representing the initial distribution
         """
-        target_data = np.histogram(target_samples, bins=self.bins, density=True)
-        initial_data = np.histogram(init_samples, bins=self.bins, density=True)
+        leftmost_bin = torch.min(torch.min(init_samples),torch.min(target_samples))-2.0
+        rightmost_bin = torch.max(torch.max(init_samples),torch.max(target_samples))+2.0
+        bins = np.arange(int(leftmost_bin), int(rightmost_bin), 0.5, dtype=np.float32)
+        target_data = np.histogram(target_samples, bins=bins, density=True)
+        initial_data = np.histogram(init_samples, bins=bins, density=True)
         init_dist = torch.tensor(initial_data[0], device=self.device).float()
-        init_dist += 1E-4 #Add elements in each bin
+
+        reg = 1/len(init_samples)
+        init_dist += reg #Add elements in each bin
         init_dist /= torch.sum(init_dist)
-        return (torch.tensor(target_data[0], device=self.device).float(),
-                init_dist)
+        target_dist = torch.tensor(target_data[0], device=self.device).float()
+        target_dist += reg #Add elements in each bin
+        target_dist /= torch.sum(target_dist)
+        return (bins, target_dist,init_dist)
 
 
 class Sinkhorn():
-    def __init__(self, device=torch.device("cpu"), train=True, source="samples"):
+    def __init__(self, device=torch.device("cpu"), train=True, source="samples",init_samples=torch.randn(1000), target_samples=torch.randn(1000)):
         self.device = device
-        self.data = Data(self.device,source)
+        self.data = Data(self.device,data_source=source,init_samples=init_samples, target_samples=target_samples)
         xs = np.array(self.data.bins[:-1])
         self.push_forward = None
         if (train):
             self._train()
 
-    def sinkhorn(self, xs, ys, w_1=None, w_2=None, n_iter=100, eps=0.01):
+    def sinkhorn(self, xs, ys, w_1=None, w_2=None, n_iter=1000, eps=0.01):
         """Applies sinkhorn algorithm
         Arguments:
             xs: A tensor of shape (num_bins_init, 1)
             ys: A tensor of shape (num_bins_final, 1)
-            w_1: weights for xs, if None assumes equal weights
+            w_1: weights for xs, if None assumes equal weights (this is "a" in comptutaional optimal transport p64 --> it is the marginal distribution )
             w_2: weights for ys, if None assumes equal weights
             n_iter: Number of iterations to train
             eps: Entropic Regularization value
         Returns:
             A torch tensor of (num_bins_init, num_bins_final) representing the
-            trained push forward
+            trained push forward --> dat's going to be trickier with higher dimensions...
         """
 
         def dist_mat(xs, ys):
-            z = xs - ys.t()
+            z = xs - ys.t()# returns a squared matrix of distances (useful trick)
             return torch.abs(z)
         with torch.no_grad():
             k = xs.shape[0]
@@ -86,28 +95,39 @@ class Sinkhorn():
                 w_2 = torch.ones(l, 1, device=self.device) / l
 
         dij = dist_mat(xs, ys)
-        K = torch.exp(-dij / eps)
+        # pretty sure we're gonne need a square in here --> might be important if we don"t put it
+        K = torch.exp(-dij ** 2 / eps)
         u = torch.ones((k, 1), device=self.device, requires_grad=True)
         v = torch.ones((l, 1), device=self.device, requires_grad=True)
 
         for i in range(n_iter):
             u = w_1 / ((K @ v) + 1e-32)
             v = w_2 / ((K.T @ u) + 1e-32)
-        return torch.diag(u.squeeze(1)) @ K @ torch.diag(v.squeeze(1))
 
-    def _train(self):
+        #rounding step as described in Culturi at al
+        up = u * torch.min(w_1 / (u * (K @ v)),torch.ones_like(u))
+        vp = v * torch.min(w_2 / (v * (K.T @ up)),torch.ones_like(up))
+        delta_a = w_1 - up * (K @ vp)
+        delta_b = w_2 - vp * (K.T @ u)
+
+        return torch.diag(up.squeeze(1)) @ K @ torch.diag(vp.squeeze(1)) +  ( delta_a @ delta_b.T ) / torch.norm(delta_a,1)
+
+    def _train(self,eps=1,n_iter=1000):
         """Trains self.push_forward map based on sinkhorn algorithm
         """
-        xs = torch.tensor(self.data.bins[:-1], device=self.device).unsqueeze(1)
+        xs = torch.tensor(self.data.bins[:-1], device=self.device).unsqueeze(1) # arbitrary bin crop but okay
         ys = xs.clone()
         self.push_forward = self.sinkhorn(xs,
                                           ys,
                                           self.data.current_dist.unsqueeze(1),
                                           self.data.target_dist.unsqueeze(1),
-                                          eps=1)
+                                          n_iter=n_iter,
+                                          eps=eps)
 
+        # print(torch.sum(self.push_forward, dim=1))
+        # print(self.data.current_dist)
         assert(torch.allclose(torch.sum(self.push_forward, dim=1),
-                              self.data.current_dist))
+                              self.data.current_dist)) # checks if we have have the marginals right
 
         assert(torch.allclose(torch.sum(self.push_forward, dim=0),
                               self.data.target_dist))
