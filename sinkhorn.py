@@ -6,10 +6,15 @@ torch.set_printoptions(sci_mode=False)
 
 
 class Data():
-    def __init__(self, device=torch.device("cpu")):
+    def __init__(self, device=torch.device("cpu"),data_source="filename",init_samples=torch.randn(1000), target_samples=torch.randn(1000)):
         self.device = device
-        self.bins = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-        self.target_dist, self.current_dist = self._init_data()
+        self.bins = np.arange(-10, 10, 1, dtype=np.float32) # hardcoding the bins might be an issue actually
+        self.init_samples = init_samples
+        self.target_samples = target_samples
+        if data_source == "filename":
+            self.target_dist, self.current_dist = self._init_data()
+        else :
+            self.target_dist, self.current_dist = self._init_data_from_samples(self.target_samples,self.init_samples)
 
     def _init_data(self, filename = "./data/high_temp_clusters_shape.npy"):
         """Initializes target_dist and current_dist
@@ -24,6 +29,22 @@ class Data():
         initial_data = np.load(filename)
         initial_data = np.histogram(initial_data, bins=self.bins, density=True)
         init_dist = torch.tensor(initial_data[0], device=self.device).float()
+        init_dist += 1E-4 #Add elements in each bin (just to make sure we never divide by 0)
+        init_dist /= torch.sum(init_dist)
+        return (torch.tensor(target_data[0], device=self.device).float(),
+                init_dist)
+
+    def _init_data_from_samples(self, init_samples, target_samples):
+        """Initializes target_dist and current_dist
+        Arguments:
+            *_samples: samples from the base and target distributions, not yet binned.
+        Returns:
+            target_dist: A tensor of shape (num_bins_init, 1) representing the target distribution
+            init_samples: A tensor of shape (num_bins_final, 1) representing the initial distribution
+        """
+        target_data = np.histogram(target_samples, bins=self.bins, density=True)
+        initial_data = np.histogram(init_samples, bins=self.bins, density=True)
+        init_dist = torch.tensor(initial_data[0], device=self.device).float()
         init_dist += 1E-4 #Add elements in each bin
         init_dist /= torch.sum(init_dist)
         return (torch.tensor(target_data[0], device=self.device).float(),
@@ -31,9 +52,9 @@ class Data():
 
 
 class Sinkhorn():
-    def __init__(self, device=torch.device("cpu"), train=True):
+    def __init__(self, device=torch.device("cpu"), train=True, source="samples"):
         self.device = device
-        self.data = Data(self.device)
+        self.data = Data(self.device,source)
         xs = np.array(self.data.bins[:-1])
         self.push_forward = None
         if (train):
