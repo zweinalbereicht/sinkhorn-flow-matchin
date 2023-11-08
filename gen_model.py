@@ -19,6 +19,42 @@ class GenModel:
     def load(self, epoch_num=None):
         pass
 
+class CouplingModel():
+    def __init__(self,bins_x,bins_y,coupling) -> None:
+        """
+        Constructs a categorical distribution to sample form a coupling with support (bins_x x bins_y)
+        Importantly, we require that Probability(bins_x[i],bins_y[j])=coupling[i,j]
+        Watch out, bins_x and bins_y are bin centers already !
+        """
+        self.bins_x=bins_x
+        self.bins_y=bins_y
+        self.coupling = coupling
+
+        self.weights = self.coupling.clone().flatten()
+        self.samples = torch.zeros(len(self.weights),2)
+
+        k=0
+        for b1 in self.bins_x:
+            for b2 in self.bins_y:
+                self.samples[k] = torch.tensor([b1,b2])
+                k+=1
+
+        print(len(self.weights),len(self.samples),len(self.bins_x))
+        # watch out for empty weights which can arise
+        mask = torch.clone(self.weights)>1e-10
+        self.weights = self.weights[mask]
+        self.samples = self.samples[mask]
+
+        # these have turned out to be too slow, let's just use a big catgorical
+        self.categorical_distribution =D.Categorical(self.weights)
+
+    def sample(self, n_samples):
+        idx_sample = self.categorical_distribution.sample((n_samples,))
+        return self.samples[idx_sample]
+
+
+
+
 # generates 2*n_dim data from the optimal coupling by convoluting with a gaussian for each bin
 class SinkhornModel():
     def __init__(self,sinkhorn : Sinkhorn):
@@ -32,36 +68,26 @@ class SinkhornModel():
 
         self.weights = torch.zeros_like(self.push_forward).flatten()
         self.means = torch.zeros(len(self.weights),2)
-        self.covs = torch.zeros(len(self.weights),2,2)
-        assert self.weights.shape[0] == self.means.shape[0] == self.covs.shape[0]
+        assert self.weights.shape[0] == self.means.shape[0]
 
         bin_centers = (self.bins[1:] + self.bins[:-1]) / 2
         for i,b1 in enumerate(bin_centers):
             for j,b2 in enumerate(bin_centers):
                 self.weights[i + nb_bins * j] = self.push_forward[i,j]
                 self.means[i + nb_bins * j] = torch.tensor([b1,b2])
-                self.covs[i + nb_bins * j] = torch.eye(2) * self.bin_size ** 2 / 2 # arbitrary choice here and hardcoded for dimension 1 -> 1
 
         # watch out for empty weights which can arise
         mask = torch.clone(self.weights)>0
         self.weights = self.weights[mask]
         self.means = self.means[mask]
-        self.covs = self.covs[mask]
 
-        component_distributions = D.Independent(D.MultivariateNormal(self.means,
-                                                                     self.covs), 0)
-        mixture_distribution = D.Categorical(self.weights)
-        self.gmm = D.MixtureSameFamily(mixture_distribution,
-                                       component_distributions)
+        # these have turned out to be too slow, let's just use a big catgorical
+        self.categorical_distribution =   D.Categorical(self.weights)
 
-    def log_prob(self, all_x):
-        log_prob = self.gmm.log_prob(all_x)
-        return log_prob
-
-    def sample(self, n_samples):
-        sample = self.gmm.sample((n_samples,))
-        log_prob = self.gmm.log_prob(sample)
-        return sample, log_prob
+    def sample_categorical(self, n_samples):
+        idx_sample = self.categorical_distribution.sample((n_samples,))
+        return self.means[idx_sample]
+        return sample
 
 class FMModel:
     def __init__(self, score_network,
@@ -99,10 +125,10 @@ class FMModel:
             all_x_t: torch.Tensor of shape (n_samples, n_time_steps, n_dim)
         """
         all_x_t = []
-        x_t, _ = self.rho_0_dist.sample(n_samples)
+        x_t = self.rho_0_dist.sample(torch.Size([n_samples,1]))
         all_t = torch.linspace(0, 1, n_time_steps, device=self.device)
         all_dt = torch.diff(all_t)
-
+        all_x_t.append(x_t)
         for (dt, t) in zip(all_dt, all_t[:-1]):
             drift = self.score_network(x_t, torch.ones(
                 x_t.shape[0], 1, device=self.device).float() * t)
@@ -110,7 +136,7 @@ class FMModel:
             all_x_t.append(x_t)
 
         all_x_t = torch.stack(all_x_t, dim=1)
-        return all_x_t
+        return all_t,all_x_t
 
     def save(self, epoch_num=None):
         pass

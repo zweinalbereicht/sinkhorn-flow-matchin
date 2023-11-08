@@ -6,16 +6,17 @@ torch.set_printoptions(sci_mode=False)
 
 
 class Data():
-    def __init__(self, device=torch.device("cpu"),data_source="filename",init_samples=torch.randn(1000), target_samples=torch.randn(1000)):
+    def __init__(self, device,source,init_samples, target_samples,bins):
         self.device = device
-        self.bins = np.arange(-10, 10, 0.5, dtype=np.float32) # hardcoding the bins might be an issue actually
+        self.nb_bins =len(bins)
+        self.bins = bins
         self.bin_size = torch.diff(torch.tensor(self.bins))[0]
         self.init_samples = init_samples
         self.target_samples = target_samples
-        if data_source == "filename":
+        if source == "filename":
             self.target_dist, self.current_dist = self._init_data()
         else :
-            self.bins, self.target_dist, self.current_dist = self._init_data_from_samples(self.init_samples,self.target_samples)
+            self.target_dist, self.current_dist = self._init_data_from_samples(self.init_samples,self.target_samples,self.bins)
             self.bin_size = torch.diff(torch.tensor(self.bins))[0]
 
     def _init_data(self, filename = "./data/high_temp_clusters_shape.npy"):
@@ -36,7 +37,7 @@ class Data():
         return (torch.tensor(target_data[0], device=self.device).float(),
                 init_dist)
 
-    def _init_data_from_samples(self, init_samples, target_samples):
+    def _init_data_from_samples(self, init_samples, target_samples,bins):
         """Initializes target_dist and current_dist
         Arguments:
             *_samples: samples from the base and target distributions, not yet binned.
@@ -44,9 +45,6 @@ class Data():
             target_dist: A tensor of shape (num_bins_init, 1) representing the target distribution
             init_samples: A tensor of shape (num_bins_final, 1) representing the initial distribution
         """
-        leftmost_bin = torch.min(torch.min(init_samples),torch.min(target_samples))-2.0
-        rightmost_bin = torch.max(torch.max(init_samples),torch.max(target_samples))+2.0
-        bins = np.arange(int(leftmost_bin), int(rightmost_bin), 0.5, dtype=np.float32)
         target_data = np.histogram(target_samples, bins=bins, density=True)
         initial_data = np.histogram(init_samples, bins=bins, density=True)
         init_dist = torch.tensor(initial_data[0], device=self.device).float()
@@ -57,20 +55,20 @@ class Data():
         target_dist = torch.tensor(target_data[0], device=self.device).float()
         target_dist += reg #Add elements in each bin
         target_dist /= torch.sum(target_dist)
-        return (bins, target_dist,init_dist)
+        return (target_dist,init_dist)
 
 
 class Sinkhorn():
-    def __init__(self, device=torch.device("cpu"), train=True, source="samples",init_samples=torch.randn(1000), target_samples=torch.randn(1000), epsilon=1):
+    def __init__(self, device=torch.device("cpu"), train=True, source="samples",bins = np.arange(100,dtype=np.float32),init_samples=torch.randn(1000), target_samples=torch.randn(1000), epsilon=1):
         self.device = device
-        self.data = Data(self.device,data_source=source,init_samples=init_samples, target_samples=target_samples)
+        self.data = Data(self.device,source=source,init_samples=init_samples, target_samples=target_samples,bins=bins)
         xs = np.array(self.data.bins[:-1])
         self.epsilon = epsilon
         self.push_forward = None
         if (train):
             self._train()
 
-    def sinkhorn(self, xs, ys, w_1=None, w_2=None, n_iter=1000, eps=0.01):
+    def sinkhorn(self, xs, ys, w_1=None, w_2=None, n_iter=1000, eps=0.01, with_grad = False):
         """Applies sinkhorn algorithm
         Arguments:
             xs: A tensor of shape (num_bins_init, 1)
@@ -97,35 +95,43 @@ class Sinkhorn():
 
         dij = dist_mat(xs, ys)
         # pretty sure we're gonne need a square in here --> might be important if we don"t put it
-        K = torch.exp(-dij ** 2 / eps)
-        u = torch.ones((k, 1), device=self.device, requires_grad=True)
-        v = torch.ones((l, 1), device=self.device, requires_grad=True)
+        K = torch.exp(- dij ** 2 / eps)
+        Kp = K / w_1
+        u = torch.ones((k, 1), device=self.device, requires_grad=with_grad)
+        v = torch.ones((l, 1), device=self.device, requires_grad=with_grad)
 
         for i in range(n_iter):
-            u = w_1 / ((K @ v) + 1e-32)
+            u = 1.0 / ((Kp @ v) + 1e-32)
             v = w_2 / ((K.T @ u) + 1e-32)
 
+        return torch.diag(u.squeeze(1)) @ K @ torch.diag(v.squeeze(1))
+
         #rounding step as described in Culturi at al
-        up = u * torch.min(w_1 / (u * (K @ v)),torch.ones_like(u))
-        vp = v * torch.min(w_2 / (v * (K.T @ up)),torch.ones_like(up))
-        delta_a = w_1 - up * (K @ vp)
-        delta_b = w_2 - vp * (K.T @ u)
+        # up = u * torch.min(w_1 / (u * (K @ v)),torch.ones_like(u))
+        # vp = v * torch.min(w_2 / (v * (K.T @ up)),torch.ones_like(up))
+        # delta_a = w_1 - up * (K @ vp)
+        # delta_b = w_2 - vp * (K.T @ u)
 
-        return torch.diag(up.squeeze(1)) @ K @ torch.diag(vp.squeeze(1)) +  ( delta_a @ delta_b.T ) / torch.norm(delta_a,1)
+        # return torch.diag(up.squeeze(1)) @ K @ torch.diag(vp.squeeze(1)) +  ( delta_a @ delta_b.T ) / torch.norm(delta_a,1)
 
-    def _train(self,eps=None,n_iter=1000):
+    def _train(self,eps=None,n_iter=1000,with_grad = False):
         """Trains self.push_forward map based on sinkhorn algorithm
         """
         xs = torch.tensor(self.data.bins[:-1], device=self.device).unsqueeze(1) # arbitrary bin crop but okay
         ys = xs.clone()
         if eps is None:
             eps = self.epsilon
+
+
         self.push_forward = self.sinkhorn(xs,
-                                          ys,
-                                          self.data.current_dist.unsqueeze(1),
-                                          self.data.target_dist.unsqueeze(1),
-                                          eps=eps,
-                                          n_iter=n_iter)
+                                        ys,
+                                        self.data.current_dist.unsqueeze(1),
+                                        self.data.target_dist.unsqueeze(1),
+                                        eps=eps,
+                                        n_iter=n_iter,
+                                        with_grad = with_grad)
+
+
 
         assert(torch.allclose(torch.sum(self.push_forward, dim=1),
                               self.data.current_dist)) # checks if we have have the marginals right
