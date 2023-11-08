@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.distributions as D
+import numpy as np
+import ot
 from sinkhorn import Sinkhorn
 
 class GenModel:
@@ -19,6 +21,38 @@ class GenModel:
     def load(self, epoch_num=None):
         pass
 
+
+# generate coupling from data_samples
+def generate_coupling(bins_x,bins_y,samples_x,samples_y,method="ot",reg=1e-3):
+    """
+    generated a coupling from samples, using POT builtin methods
+    method : "product' ,"ot", "sinkhorn"
+
+
+    returns:
+    bins_x : torch.tensor
+    bins_y : torch.tensor
+    coupling : torch.tensor
+    """
+    h_x = np.histogram(samples_x,bins=bins_x,density=True)[0]
+    h_y = np.histogram(samples_y,bins=bins_y,density=True)[0]
+    bins_x_t = torch.tensor(( bins_x[1:] + bins_x[:-1] )/ 2).unsqueeze(-1)
+    bins_y_t = torch.tensor((bins_y[1:] + bins_y[:-1] ) /  2 ).unsqueeze(-1)
+    cost_matrix = (bins_x_t - bins_y_t.T) ** 2
+    cost_matrix_array = cost_matrix.numpy()
+    if method=="product":
+        coupling = (torch.tensor(h_x).unsqueeze(-1) * torch.tensor(h_y).unsqueeze(-1).T).numpy()
+        coupling = coupling/coupling.sum()
+    elif method=="ot":
+        coupling = ot.emd(h_x,h_y,cost_matrix_array)
+    elif method=="sinkhorn":
+        coupling = ot.sinkhorn(h_x,h_y,cost_matrix_array,reg=reg,method='sinkhorn_stabilized',numItermax=1000)
+    else:
+        return NotImplementedError
+    return h_x, h_y, bins_x_t.squeeze(-1),bins_y_t.squeeze(-1),torch.tensor(coupling)
+
+
+# build categorical distribution associated to coupling
 class CouplingModel():
     def __init__(self,bins_x,bins_y,coupling) -> None:
         """
@@ -39,7 +73,7 @@ class CouplingModel():
                 self.samples[k] = torch.tensor([b1,b2])
                 k+=1
 
-        print(len(self.weights),len(self.samples),len(self.bins_x))
+        # print(len(self.weights),len(self.samples),len(self.bins_x))
         # watch out for empty weights which can arise
         mask = torch.clone(self.weights)>1e-10
         self.weights = self.weights[mask]
@@ -54,40 +88,6 @@ class CouplingModel():
 
 
 
-
-# generates 2*n_dim data from the optimal coupling by convoluting with a gaussian for each bin
-class SinkhornModel():
-    def __init__(self,sinkhorn : Sinkhorn):
-        # super().__init__()
-        self.bins = sinkhorn.data.bins
-        self.bin_size = sinkhorn.data.bin_size
-        self.push_forward = sinkhorn.push_forward
-
-        # watch out for discrepancy in size of bins and push_forward
-        nb_bins = len(self.push_forward)
-
-        self.weights = torch.zeros_like(self.push_forward).flatten()
-        self.means = torch.zeros(len(self.weights),2)
-        assert self.weights.shape[0] == self.means.shape[0]
-
-        bin_centers = (self.bins[1:] + self.bins[:-1]) / 2
-        for i,b1 in enumerate(bin_centers):
-            for j,b2 in enumerate(bin_centers):
-                self.weights[i + nb_bins * j] = self.push_forward[i,j]
-                self.means[i + nb_bins * j] = torch.tensor([b1,b2])
-
-        # watch out for empty weights which can arise
-        mask = torch.clone(self.weights)>0
-        self.weights = self.weights[mask]
-        self.means = self.means[mask]
-
-        # these have turned out to be too slow, let's just use a big catgorical
-        self.categorical_distribution =   D.Categorical(self.weights)
-
-    def sample_categorical(self, n_samples):
-        idx_sample = self.categorical_distribution.sample((n_samples,))
-        return self.means[idx_sample]
-        return sample
 
 class FMModel:
     def __init__(self, score_network,
