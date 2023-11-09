@@ -4,6 +4,7 @@ import torch.distributions as D
 import numpy as np
 import ot
 from sinkhorn import Sinkhorn
+from torch.utils.tensorboard import SummaryWriter
 
 class GenModel:
     def __init__(self):
@@ -90,13 +91,23 @@ class CouplingModel():
 
 
 class FMModel:
-    def __init__(self, score_network,
+    def __init__(self,
+                 flow_network,
+                 flow_network_opt,
+                 flow_network_scheduler,
+                 score_network,
                  score_network_opt, score_network_scheduler,
                  rho_0_dist,
                  device=torch.device('cuda:0')):
+
+        self.flow_network = flow_network
+        self.flow_network_opt = flow_network_opt
+        self.flow_network_scheduler = flow_network_scheduler
+
         self.score_network = score_network
         self.score_network_opt = score_network_opt
         self.score_network_scheduler = score_network_scheduler
+
         self.rho_0_dist = rho_0_dist
         self.device = device
 
@@ -111,10 +122,17 @@ class FMModel:
                * (1 - 1e-4))
               + 1e-4)
         mu = ts * x1 + (1 - ts) * x0
-        x = torch.randn_like(x1) * sigma + mu
-        loss = nn.MSELoss()((x1 - x0),
+        epsilon = torch.randn_like(x1)
+        x = epsilon * sigma + mu
+
+        # learn the flow
+        flow_loss = nn.MSELoss()((x1 - x0),
+                            self.flow_network(x, ts))
+        # learn the score
+        score_loss = nn.MSELoss()(- epsilon / sigma,
                             self.score_network(x, ts))
-        return loss
+
+        return flow_loss, score_loss
 
     def sample(self, n_samples, n_time_steps=100):
         """
@@ -130,7 +148,7 @@ class FMModel:
         all_dt = torch.diff(all_t)
         all_x_t.append(x_t)
         for (dt, t) in zip(all_dt, all_t[:-1]):
-            drift = self.score_network(x_t, torch.ones(
+            drift = self.flow_network(x_t, torch.ones(
                 x_t.shape[0], 1, device=self.device).float() * t)
             x_t = x_t + drift * dt
             all_x_t.append(x_t)
@@ -138,5 +156,60 @@ class FMModel:
         all_x_t = torch.stack(all_x_t, dim=1)
         return all_t,all_x_t
 
+    # recast ODE into SDE using the learned score
+    def sample_diffusion(self, n_samples, n_time_steps=100, temperature=0.1):
+        """
+        Arguments:
+            n_samples: int
+            n_time_steps: int
+        Returns:
+            all_x_t: torch.Tensor of shape (n_samples, n_time_steps, n_dim)
+        """
+        all_x_t = []
+        x_t = self.rho_0_dist.sample(torch.Size([n_samples,1]))
+        all_t = torch.linspace(0, 1, n_time_steps, device=self.device)
+        all_dt = torch.diff(all_t)
+        all_x_t.append(x_t)
+        for (dt, t) in zip(all_dt, all_t[:-1]):
+            ts  = torch.ones(x_t.shape[0], 1, device=self.device).float() * t
+            drift = self.flow_network(x_t,ts) + temperature * self.score_network(x_t,ts)
+            x_t = x_t + drift * dt + torch.sqrt( 2 * temperature * dt ) * torch.randn_like(x_t)
+            all_x_t.append(x_t)
+
+        all_x_t = torch.stack(all_x_t, dim=1)
+        return all_t,all_x_t
+
     def save(self, epoch_num=None):
         pass
+
+def train_fm(fm_model, fm_dataloader, num_epochs=1000,
+             save_epoch_freq=25,
+             folder_name="./", tag="logs"):
+    writer = SummaryWriter(log_dir=folder_name + tag)
+    num_batches = len(fm_dataloader)
+    for epoch in range(num_epochs):
+        epoch_flow_loss = 0
+        epoch_score_loss = 0
+        for (train_x0, train_x1) in fm_dataloader:
+            flow_loss, score_loss = fm_model.get_flow_matching_loss(train_x0, train_x1)
+
+            fm_model.flow_network_opt.zero_grad()
+            fm_model.score_network_opt.zero_grad()
+
+
+            flow_loss.backward()
+            score_loss.backward()
+
+            fm_model.flow_network_opt.step()
+            fm_model.score_network_opt.step()
+
+            epoch_flow_loss += flow_loss.item()
+            epoch_score_loss += score_loss.item()
+
+        fm_model.flow_network_scheduler.step(epoch_flow_loss/num_batches)
+        fm_model.score_network_scheduler.step(epoch_score_loss/num_batches)
+
+        writer.add_scalar("Flow Matching Loss", epoch_flow_loss/num_batches, epoch)
+        writer.add_scalar("Score Matching Loss", epoch_score_loss/num_batches, epoch)
+        if epoch % save_epoch_freq == 0:
+            fm_model.save(epoch_num=epoch)
