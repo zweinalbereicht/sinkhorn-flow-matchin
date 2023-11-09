@@ -5,6 +5,7 @@ import numpy as np
 import ot
 from sinkhorn import Sinkhorn
 from torch.utils.tensorboard import SummaryWriter
+from utils import langevin
 
 class GenModel:
     def __init__(self):
@@ -31,9 +32,12 @@ def generate_coupling(bins_x,bins_y,samples_x,samples_y,method="ot",reg=1e-3):
 
 
     returns:
-    bins_x : torch.tensor
-    bins_y : torch.tensor
+    h_x : weights of the histogram of samples_x
+    h_y : weights of the histogram of samples_y
+    bins_x : centered bins of the histogram of samples_x
+    bins_y : centered bins of the histogram of samples_y
     coupling : torch.tensor
+    distance : Sum dij * pij
     """
     h_x = np.histogram(samples_x,bins=bins_x,density=True)[0]
     h_y = np.histogram(samples_y,bins=bins_y,density=True)[0]
@@ -46,11 +50,14 @@ def generate_coupling(bins_x,bins_y,samples_x,samples_y,method="ot",reg=1e-3):
         coupling = coupling/coupling.sum()
     elif method=="ot":
         coupling = ot.emd(h_x,h_y,cost_matrix_array)
+        coupling = coupling/coupling.sum()
     elif method=="sinkhorn":
         coupling = ot.sinkhorn(h_x,h_y,cost_matrix_array,reg=reg,method='sinkhorn_stabilized',numItermax=1000)
+        coupling = coupling/coupling.sum()
     else:
         return NotImplementedError
-    return h_x, h_y, bins_x_t.squeeze(-1),bins_y_t.squeeze(-1),torch.tensor(coupling)
+    distance = np.sum( coupling * cost_matrix_array )
+    return h_x, h_y, bins_x_t.squeeze(-1),bins_y_t.squeeze(-1),torch.tensor(coupling), distance
 
 
 # build categorical distribution associated to coupling
@@ -134,7 +141,9 @@ class FMModel:
 
         return flow_loss, score_loss
 
+    # sample ODE
     def sample(self, n_samples, n_time_steps=100):
+
         """
         Arguments:
             n_samples: int
@@ -142,19 +151,23 @@ class FMModel:
         Returns:
             all_x_t: torch.Tensor of shape (n_samples, n_time_steps, n_dim)
         """
-        all_x_t = []
-        x_t = self.rho_0_dist.sample(torch.Size([n_samples,1]))
-        all_t = torch.linspace(0, 1, n_time_steps, device=self.device)
-        all_dt = torch.diff(all_t)
-        all_x_t.append(x_t)
-        for (dt, t) in zip(all_dt, all_t[:-1]):
-            drift = self.flow_network(x_t, torch.ones(
-                x_t.shape[0], 1, device=self.device).float() * t)
-            x_t = x_t + drift * dt
-            all_x_t.append(x_t)
 
-        all_x_t = torch.stack(all_x_t, dim=1)
-        return all_t,all_x_t
+        # all_x_t = []
+        # x_t = self.rho_0_dist.sample(torch.Size([n_samples,1]))
+        # all_t = torch.linspace(0, 1, n_time_steps, device=self.device)
+        # all_dt = torch.diff(all_t)
+        # all_x_t.append(x_t)
+        # for (dt, t) in zip(all_dt, all_t[:-1]):
+        #     drift = self.flow_network(x_t, torch.ones(
+        #         x_t.shape[0], 1, device=self.device).float() * t)
+        #     x_t = x_t + drift * dt
+        #     all_x_t.append(x_t)
+
+        # all_x_t = torch.stack(all_x_t, dim=1)
+        with torch.no_grad():
+            x0 = self.rho_0_dist.sample(torch.Size([n_samples,1]))
+            ts,all_xt, _ = langevin(x0,lambda t,xt : self.flow_network(xt,t),lambda t,xt : 0,nb_time_steps=n_time_steps)
+        return ts, all_xt
 
     # recast ODE into SDE using the learned score
     def sample_diffusion(self, n_samples, n_time_steps=100, temperature=0.1):
@@ -163,21 +176,27 @@ class FMModel:
             n_samples: int
             n_time_steps: int
         Returns:
-            all_x_t: torch.Tensor of shape (n_samples, n_time_steps, n_dim)
+            all_t: torch.Tensor of shape (n_samples, n_time_steps)
+            all_xt: torch.Tensor of shape (n_samples, n_dim, n_time_steps)
+            all_qt: torch.Tensor of shape (n_samples, n_time_steps)
         """
-        all_x_t = []
-        x_t = self.rho_0_dist.sample(torch.Size([n_samples,1]))
-        all_t = torch.linspace(0, 1, n_time_steps, device=self.device)
-        all_dt = torch.diff(all_t)
-        all_x_t.append(x_t)
-        for (dt, t) in zip(all_dt, all_t[:-1]):
-            ts  = torch.ones(x_t.shape[0], 1, device=self.device).float() * t
-            drift = self.flow_network(x_t,ts) + temperature * self.score_network(x_t,ts)
-            x_t = x_t + drift * dt + torch.sqrt( 2 * temperature * dt ) * torch.randn_like(x_t)
-            all_x_t.append(x_t)
+        # all_x_t = []
+        # x_t = self.rho_0_dist.sample(torch.Size([n_samples,1]))
+        # all_t = torch.linspace(0, 1, n_time_steps, device=self.device)
+        # all_dt = torch.diff(all_t)
+        # all_x_t.append(x_t)
+        # for (dt, t) in zip(all_dt, all_t[:-1]):
+        #     ts  = torch.ones(x_t.shape[0], 1, device=self.device).float() * t
+        #     drift = self.flow_network(x_t,ts) + temperature * self.score_network(x_t,ts)
+        #     x_t = x_t + drift * dt + torch.sqrt( 2 * temperature * dt ) * torch.randn_like(x_t)
+        #     all_x_t.append(x_t)
 
-        all_x_t = torch.stack(all_x_t, dim=1)
-        return all_t,all_x_t
+        # all_x_t = torch.stack(all_x_t, dim=1)
+        # return all_t,all_x_t
+        with torch.no_grad():
+                x0 = self.rho_0_dist.sample(torch.Size([n_samples,1]))
+                ts,all_xt,all_qt = langevin(x0,lambda t,xt : self.flow_network(xt,t) + temperature *self.score_network(xt,t),lambda t,xt : temperature, nb_time_steps=n_time_steps)
+        return ts, all_xt, all_qt
 
     def save(self, epoch_num=None):
         pass
