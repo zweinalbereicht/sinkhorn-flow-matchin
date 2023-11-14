@@ -2,3 +2,6 @@ figures
 models
 *.ipynb
 logs
+latex
+submit*
+soumis*

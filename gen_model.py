@@ -94,7 +94,157 @@ class CouplingModel():
         idx_sample = self.categorical_distribution.sample((n_samples,))
         return self.samples[idx_sample]
 
+# generates coupling from samples in 2d space
+# --> note that all of this is actually quite expensive ,it'll probably be easier to just use dirac delta-like smaples.
+def generate_coupling_ddim(bins,samples_1,samples_2,method="ot",reg=1e-3):
+    """
+    generated a coupling from samples, using POT builtin methods
+    method : "product' ,"ot", "sinkhorn"
 
+    Only works in d=2 for now
+
+    Args:
+    bins : bins of the histogram of samples_x -> tuple of ndim tensors
+    samples_1 : samples from the first distribution (nbsamples,ndim)
+    samples_2 : samples from the second distribution (nbsamples,ndim)
+
+
+    returns:
+    weight_1 : weights of the histogram of samples_1
+    weight_2 : weights of the histogram of samples_2
+    all_pairs : all pairs of samples possible
+    coupling : the optimal coupling between all pairs of these samples
+    distance : Sum dij * pij
+    """
+
+    h_1 = np.histogramdd(samples_1,bins=bins,density=True)
+    h_2 = np.histogramdd(samples_2,bins=bins,density=True)
+    weights_1 = h_1[0].flatten() #size (nb_bin * nb_bin)
+    weights_2 = h_2[0].flatten()
+    binx, biny = bins
+    nb_bins = len(binx)-1
+
+    # bin centers
+    binx_c = ( binx[1:] + binx[:-1] )/ 2
+    biny_c = ( biny[1:] + biny[:-1] )/ 2
+
+    # contains the centers of the bins
+    flat_bins = torch.zeros((len(weights_1),2)) #size (nb_bin * nb_bin,2)
+
+    # contains the distances between bins (nb_bin * nb_bin,nb_bin * nb_bin)
+    cost_matrix = torch.zeros((nb_bins ** 2,nb_bins ** 2))
+    product_coupling = torch.zeros((nb_bins ** 2,nb_bins ** 2))
+
+    k=0
+    for el_x in binx_c:
+        for el_y in biny_c:
+            flat_bins[k]=torch.tensor([el_x,el_y])
+            k+=1
+
+    # compute cost matrix and all pairs
+    k=0
+    all_pairs = torch.zeros((nb_bins ** 2 * nb_bins ** 2,2,2))
+    for i,c1 in enumerate(flat_bins):
+        for j,c2 in enumerate(flat_bins):
+            product_coupling[i,j]=weights_1[i]*weights_2[j]
+            cost_matrix[i,j]=torch.sum((c1-c2)**2)
+            all_pairs[k] = torch.stack((c1,c2),dim=0)
+            k+=1
+
+    cost_matrix_array = cost_matrix.numpy()
+
+    if method=="product":
+        coupling = product_coupling.numpy() # A REVOIR
+        coupling = coupling/coupling.sum()
+    elif method=="ot":
+        coupling = ot.emd(weights_1,weights_2,cost_matrix_array)
+        coupling = coupling/coupling.sum()
+    elif method=="sinkhorn":
+        coupling = ot.sinkhorn(weights_1,weights_2,cost_matrix_array,reg=reg,method='sinkhorn_stabilized',numItermax=1000)
+        coupling = coupling/coupling.sum()
+    else:
+        return NotImplementedError
+    distance = np.sum( coupling * cost_matrix_array)
+    print(distance)
+    return (weights_1, weights_2, all_pairs, torch.tensor(coupling), distance)
+
+def generate_coupling_empirical(samples1,samples2,method="product", reg=0.1):
+    """
+    Only works in d=2 for now
+
+    Args:
+    bins : bins of the histogram of samples_x -> tuple of ndim tensors
+    samples_1 : samples from the first distribution (nbsamples,ndim)
+    samples_2 : samples from the second distribution (nbsamples,ndim)
+
+
+    returns:
+    weight_1 : weights of the histogram of samples_1
+    weight_2 : weights of the histogram of samples_2
+    all_pairs : all pairs of samples possible
+    coupling : the optimal coupling between all pairs of these samples
+    distance : Sum dij * pij
+    """
+
+    n=len(samples1)
+    ndim = samples1.shape[1]
+    w = torch.ones(n)/n
+
+     # compute all pairs
+    k=0
+    all_pairs = torch.zeros((n * n,2,ndim))
+    for i,c1 in enumerate(samples1):
+        for j,c2 in enumerate(samples2):
+            all_pairs[k] = torch.stack((c1,c2),dim=0)
+            k+=1
+
+    cost_matrix = ot.dist(samples1,samples2)
+
+
+    if method=="product":
+        coupling = torch.ones((n,n)) / n ** 2 # A REVOIR
+        coupling = coupling/coupling.sum()
+    elif method=="ot":
+        coupling = ot.emd(w,w,cost_matrix)
+        coupling = coupling/coupling.sum()
+    elif method=="sinkhorn":
+        coupling = ot.sinkhorn(w,w,cost_matrix,reg=reg,method='sinkhorn_stabilized',numItermax=1000)
+        coupling = coupling/coupling.sum()
+    else:
+        return NotImplementedError
+    # print(coupling.shape,cost_matrix.shape)
+    distance = torch.sum(coupling * cost_matrix)
+    # print(distance)
+    return (w, w, all_pairs, torch.tensor(coupling), distance)
+
+class CouplingModel2d():
+    def __init__(self,all_pairs,coupling) -> None:
+        """
+        Args:
+            all_pairs: cartesian product of all source <-> target pairs
+            coupling: assoiated coupling weight
+        """
+
+        self.weights = coupling.clone().detach().flatten()
+        self.samples = all_pairs
+
+
+        # print(len(self.weights),len(self.samples),len(self.bins_x))
+        # watch out for empty weights which can arise
+        mask = torch.clone(self.weights)>1e-10
+        self.weights = self.weights[mask]
+        self.samples = self.samples[mask]
+
+        # these have turned out to be too slow, let's just use a big catgorical
+        self.categorical_distribution = D.Categorical(self.weights)
+
+    def sample(self, n_samples):
+        """
+        returns a list of samples in the form [[[x1,y1],[x2,y2]],..]
+        """
+
+        idx_sample = self.categorical_distribution.sample((n_samples,))
+        return self.samples[idx_sample]
 
 
 class FMModel:
@@ -165,7 +315,9 @@ class FMModel:
 
         # all_x_t = torch.stack(all_x_t, dim=1)
         with torch.no_grad():
-            x0 = self.rho_0_dist.sample(torch.Size([n_samples,1]))
+            x0 = self.rho_0_dist.sample(torch.Size([n_samples]))
+            if x0.dim()==1:
+                x0=x0.unsqueeze(-1)
             ts,all_xt, _ = langevin(x0,lambda t,xt : self.flow_network(xt,t),lambda t,xt : 0,nb_time_steps=n_time_steps)
         return ts, all_xt
 
@@ -194,8 +346,10 @@ class FMModel:
         # all_x_t = torch.stack(all_x_t, dim=1)
         # return all_t,all_x_t
         with torch.no_grad():
-                x0 = self.rho_0_dist.sample(torch.Size([n_samples,1]))
-                ts,all_xt,all_qt = langevin(x0,lambda t,xt : self.flow_network(xt,t) + temperature *self.score_network(xt,t),lambda t,xt : temperature, nb_time_steps=n_time_steps)
+                x0 = self.rho_0_dist.sample(torch.Size([n_samples]))
+                if x0.dim()==1:
+                    x0=x0.unsqueeze(-1)
+                ts,all_xt,all_qt = langevin(x0,lambda t,xt : self.flow_network(xt,t) + temperature * self.score_network(xt,t),lambda t,xt : temperature, nb_time_steps=n_time_steps)
         return ts, all_xt, all_qt
 
     def save(self, epoch_num=None):

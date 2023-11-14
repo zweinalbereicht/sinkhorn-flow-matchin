@@ -40,7 +40,7 @@ def langevin(x0 : torch.tensor, force, diffusion_matrix, final_time = 1.0, nb_ti
 
     Returns:
         ts : time steps
-        all_xt : all the Xt (nb_samples, nb_dim, nb_time_steps)
+        all_xt : all the Xt (nb_samples,nb_time_steps,nbdim)
         all_qt : all the startonovitch heat increments (nb_samples, nb_time_steps)
     """
     ts = torch.linspace(0,final_time,nb_time_steps, device = 'cpu').float()
@@ -50,17 +50,17 @@ def langevin(x0 : torch.tensor, force, diffusion_matrix, final_time = 1.0, nb_ti
 
     all_xt = []
     all_qt = []
-    all_xt.append(xt.unsqueeze(-1))
+    all_xt.append(xt.unsqueeze(1))
 
     k=1
     for (t,dt) in zip(ts[1:],dts):
         prev_xt = xt.clone()
-        time = torch.ones_like(xt) * t
+        time = torch.ones((xt.shape[0],1)) * t
         drift = force(time,xt) * dt
         # we hardcode the two here
         difusion = torch.sqrt( 2 * diffusion_matrix(time,xt) * torch.abs(dt)) * torch.randn_like(xt)
         xt = xt + drift + difusion
-        all_xt.append(xt.unsqueeze(-1))
+        all_xt.append(xt.unsqueeze(1))
 
 
         # compute stratonovitch heat increment
@@ -71,7 +71,7 @@ def langevin(x0 : torch.tensor, force, diffusion_matrix, final_time = 1.0, nb_ti
 
         all_qt.append(qt.unsqueeze(-1))
         k+=1
-    return ts,torch.cat(all_xt,dim=-1),torch.cat(all_qt,dim=-1)
+    return ts,torch.cat(all_xt,dim=1),torch.cat(all_qt,dim=-1)
 
 if __name__ == "__main__":
     m1 = torch.tensor([0.0])
