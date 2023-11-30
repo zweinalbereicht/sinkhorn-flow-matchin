@@ -1,0 +1,6 @@
+figures
+latex
+logs
+models
+*.ipynb
+__pycache__
